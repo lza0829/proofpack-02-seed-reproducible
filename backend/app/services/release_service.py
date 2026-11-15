@@ -6,14 +6,20 @@ from typing import Any
 from fastapi import HTTPException
 
 from app.db import connect
+from app.engines.sample import SAMPLING_ALGORITHM
 from app.repositories import checklist as check_repo
 from app.repositories import packs as pack_repo
 from app.repositories import releases as release_repo
+from app.repositories import samples as sample_repo
 from app.repositories import settings as settings_repo
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _same_sampling_params(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return str(a["seed"]) == str(b["seed"]) and float(a["rate"]) == float(b["rate"])
 
 
 def list_releases(limit: int = 50) -> list[dict[str, Any]]:
@@ -30,14 +36,6 @@ def list_releases(limit: int = 50) -> list[dict[str, Any]]:
         conn.close()
 
 
-def list_settings() -> dict[str, str]:
-    conn = connect()
-    try:
-        return settings_repo.list_settings(conn)
-    finally:
-        conn.close()
-
-
 def decide(pack_id: int, decision: str, reason: str | None = None) -> dict[str, Any]:
     decision = (decision or "").strip().lower()
     if decision not in ("pass", "reject"):
@@ -48,6 +46,38 @@ def decide(pack_id: int, decision: str, reason: str | None = None) -> dict[str, 
         pack = pack_repo.get_pack(conn, pack_id)
         if not pack:
             raise HTTPException(status_code=404, detail="证据包不存在")
+
+        # 只允许从“就绪”批次打包出的、未被换代策略降级的包进入放行流程。
+        # 旧种子批次生成的包（reference / voided）不得与新生批次并存可放行。
+        if pack["status"] in ("reference", "voided"):
+            label = {
+                "reference": "只读对照包",
+                "voided": "已作废包",
+            }[pack["status"]]
+            raise HTTPException(
+                status_code=409,
+                detail=f"该证据包为{label}，不得放行；请按当前批次重新生成证据包。",
+            )
+
+        batch = sample_repo.get_batch(conn, pack["batch_id"])
+        if not batch or batch["status"] != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail="证据包关联的采样批次已退出可放行路径，不得放行。",
+            )
+        if batch["algorithm"] != SAMPLING_ALGORITHM:
+            raise HTTPException(
+                status_code=409,
+                detail="证据包关联的采样批次算法版本与当前不一致，不得放行。",
+            )
+        # 兜底：同对象只认最新就绪批次的采样参数（种子 + 采样率）。
+        # 同参数重跑等价；参数不同则旧样本的包不得放行，避免新旧样本同时可放行。
+        latest = sample_repo.latest_ready_for_subject(conn, pack["subject_id"])
+        if latest and not _same_sampling_params(batch, latest):
+            raise HTTPException(
+                status_code=409,
+                detail="该证据包对应的种子或采样率已非该对象当前参数，不得放行；请按最新批次重新打包。",
+            )
 
         results = check_repo.list_results(conn, pack_id=pack_id)
         if not results:

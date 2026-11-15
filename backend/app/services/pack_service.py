@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from app.db import connect
 from app.engines.checksum import item_fingerprint, pack_fingerprint
+from app.engines.sample import SAMPLING_ALGORITHM
 from app.repositories import packs as pack_repo
 from app.repositories import samples as sample_repo
 from app.repositories import subjects as subject_repo
@@ -21,13 +22,61 @@ def list_packs(limit: int = 50) -> list[dict[str, Any]]:
     try:
         rows = pack_repo.list_packs(conn, limit=limit)
         subjects = {s["id"]: s for s in subject_repo.list_subjects(conn)}
+        batches = {b["id"]: b for b in sample_repo.list_batches(conn, limit=1000)}
+        authoritative = sample_repo.latest_ready_batches(conn)
         for r in rows:
             s = subjects.get(r["subject_id"])
             r["subject_code"] = s["code"] if s else None
             r["subject_title"] = s["title"] if s else None
+            attach_batch_provenance(
+                r, batches.get(r["batch_id"]), authoritative.get(r["subject_id"])
+            )
         return rows
     finally:
         conn.close()
+
+
+def _same_sampling_params(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return str(a["seed"]) == str(b["seed"]) and float(a["rate"]) == float(b["rate"])
+
+
+def attach_batch_provenance(
+    pack: dict[str, Any],
+    batch: dict[str, Any] | None,
+    authoritative: dict[str, Any] | None = None,
+) -> None:
+    """Surface the sampling provenance a pack was built from, for audit."""
+    if not batch:
+        pack.update(
+            batch_no=None,
+            seed=None,
+            rate=None,
+            source_count=None,
+            sample_count=None,
+            algorithm=None,
+            seed_source=None,
+            batch_status=None,
+            releasable=False,
+        )
+        return
+    pack["batch_no"] = batch["batch_no"]
+    pack["seed"] = batch["seed"]
+    pack["rate"] = batch["rate"]
+    pack["source_count"] = batch["source_count"]
+    pack["sample_count"] = batch["sample_count"]
+    pack["algorithm"] = batch["algorithm"]
+    pack["seed_source"] = batch["seed_source"]
+    pack["batch_status"] = batch["status"]
+    # releasable 表示“还能进入放行流程”：已放行、只读对照、作废包都不算。
+    # 另外只认该对象最新就绪批次的采样参数（种子 + 采样率）：
+    # 同参数重跑等价，允许；参数不同则旧样本不得与新样本同时可放行。
+    params_current = authoritative is None or _same_sampling_params(batch, authoritative)
+    pack["releasable"] = (
+        pack["status"] not in ("released", "reference", "voided")
+        and batch["status"] == "ready"
+        and batch["algorithm"] == SAMPLING_ALGORITHM
+        and params_current
+    )
 
 
 def get_pack(pack_id: int) -> dict[str, Any]:
@@ -39,6 +88,11 @@ def get_pack(pack_id: int) -> dict[str, Any]:
         s = subject_repo.get_subject(conn, p["subject_id"])
         p["subject_code"] = s["code"] if s else None
         p["subject_title"] = s["title"] if s else None
+        attach_batch_provenance(
+            p,
+            sample_repo.get_batch(conn, p["batch_id"]),
+            sample_repo.latest_ready_batches(conn).get(p["subject_id"]),
+        )
         p["items"] = pack_repo.list_items(conn, pack_id)
         return p
     finally:
@@ -51,6 +105,19 @@ def build_pack(batch_id: int) -> dict[str, Any]:
         batch = sample_repo.get_batch(conn, batch_id)
         if not batch:
             raise HTTPException(status_code=404, detail="采样批次不存在")
+        if batch["status"] != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail=f"采样批次状态为 {batch['status']}，已退出可打包路径；请按新种子重新采样。",
+            )
+        # 只允许按该对象最新就绪批次的采样参数（种子 + 采样率）打包：
+        # 同参数重跑等价可继续；参数不同则旧样本不得再生成新包。
+        latest = sample_repo.latest_ready_for_subject(conn, batch["subject_id"])
+        if latest and not _same_sampling_params(batch, latest):
+            raise HTTPException(
+                status_code=409,
+                detail="该采样批次的种子或采样率已非该对象当前参数，不得打包；请按最新批次重新采样。",
+            )
         rows = sample_repo.list_rows(conn, batch_id)
         if not rows:
             raise HTTPException(status_code=400, detail="采样批次无样本行")
@@ -105,7 +172,7 @@ def build_pack(batch_id: int) -> dict[str, Any]:
         conn.commit()
 
         subject = subject_repo.get_subject(conn, batch["subject_id"])
-        return {
+        result = {
             "id": pack_id,
             "pack_no": pack_no,
             "batch_id": batch_id,
@@ -118,5 +185,7 @@ def build_pack(batch_id: int) -> dict[str, Any]:
             "created_at": now,
             "items": pack_repo.list_items(conn, pack_id),
         }
+        attach_batch_provenance(result, batch)
+        return result
     finally:
         conn.close()

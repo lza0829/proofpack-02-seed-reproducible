@@ -71,6 +71,17 @@ def get_pack(conn: sqlite3.Connection, pack_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def list_for_batch(conn: sqlite3.Connection, batch_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, pack_no, batch_id, subject_id, item_count, fingerprint, status, created_at
+        FROM evidence_packs WHERE batch_id=? ORDER BY id
+        """,
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_items(conn: sqlite3.Connection, pack_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """

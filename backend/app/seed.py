@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 from app.db import connect
+from app.engines.sample import SAMPLING_ALGORITHM
+from app.policies import DEFAULT_BATCH_POLICY, DEFAULT_SEED_POLICY
 
 # 举证对象种子
 SUBJECT_SEEDS = [
@@ -32,9 +35,33 @@ SUBJECT_SEEDS = [
     },
 ]
 
+# 设置默认值。seed_policy / batch_policy 各自是一组互斥取值。
+DEFAULT_SETTINGS = {
+    "default_sample_rate": "0.3",
+    "require_checklist_pass": "1",
+    # 取值与语义见 app/policies.py
+    "seed_policy": DEFAULT_SEED_POLICY,
+    "batch_policy": DEFAULT_BATCH_POLICY,
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Lightweight forward migration: add a column if an older DB lacks it."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    # 采样批次的可复现审计字段
+    _add_column(conn, "sample_batches", "algorithm", f"TEXT NOT NULL DEFAULT '{SAMPLING_ALGORITHM}'")
+    _add_column(conn, "sample_batches", "seed_source", "TEXT NOT NULL DEFAULT 'explicit'")
+    _add_column(conn, "sample_batches", "source_fingerprint", "TEXT")
+    _add_column(conn, "sample_batches", "sample_keys_fingerprint", "TEXT")
 
 
 def init_db() -> None:
@@ -54,6 +81,8 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
             -- 采样批次
+            -- seed / rate / source_count / sample_count 是批次必须写明的举证要素；
+            -- algorithm / source_fingerprint / sample_keys_fingerprint 用于事后复核同种子重跑。
             CREATE TABLE IF NOT EXISTS sample_batches(
                 id INTEGER PRIMARY KEY,
                 batch_no TEXT NOT NULL UNIQUE,
@@ -64,6 +93,10 @@ def init_db() -> None:
                 sample_count INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                algorithm TEXT NOT NULL DEFAULT 'sha256-bucket-v1',
+                seed_source TEXT NOT NULL DEFAULT 'explicit',
+                source_fingerprint TEXT,
+                sample_keys_fingerprint TEXT,
                 FOREIGN KEY(subject_id) REFERENCES subjects(id)
             );
             -- 样本行
@@ -123,6 +156,16 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            -- 采样 / 换代审计事件
+            CREATE TABLE IF NOT EXISTS audit_events(
+                id INTEGER PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                subject_id INTEGER,
+                batch_id INTEGER,
+                pack_id INTEGER,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             -- 影子试跑（空挂，后题用）
             CREATE TABLE IF NOT EXISTS shadow_runs(
                 id INTEGER PRIMARY KEY,
@@ -143,6 +186,7 @@ def init_db() -> None:
             );
             """
         )
+        _migrate(conn)
         if conn.execute("SELECT COUNT(*) c FROM subjects").fetchone()["c"] == 0:
             now = _now()
             for s in SUBJECT_SEEDS:
@@ -162,19 +206,14 @@ def init_db() -> None:
                         now,
                     ),
                 )
-        if conn.execute("SELECT COUNT(*) c FROM settings").fetchone()["c"] == 0:
+        for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("default_sample_rate", "0.3"),
+                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                (key, value),
             )
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("require_checklist_pass", "1"),
-            )
-            conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("sample_mode", "seeded"),
-            )
+        # 移除历史上未接线的 sample_mode（随机/确定性冒充开关），
+        # 避免“不可复现随机”被误读成固定种子。
+        conn.execute("DELETE FROM settings WHERE key='sample_mode'")
         conn.commit()
     finally:
         conn.close()

@@ -35,6 +35,18 @@ async function run() {
   }
 }
 
+function statusLabel(s) {
+  return ({
+    built: '已生成',
+    checked_ok: '校验通过',
+    checked_fail: '校验未过',
+    released: '已放行',
+    rejected: '已驳回',
+    reference: '只读对照',
+    voided: '已作废',
+  })[s] || s
+}
+
 async function onPackChange() {
   history.value = await getJSON(`/api/checklist?pack_id=${packId.value}`)
   result.value = null
@@ -52,7 +64,7 @@ async function onPackChange() {
           <label>证据包</label>
           <select v-model="packId" @change="onPackChange">
             <option v-for="p in packs" :key="p.id" :value="p.id">
-              {{ p.pack_no }}（{{ p.item_count }} 条 · {{ ({ built: '已生成', checked_ok: '校验通过', checked_fail: '校验未过', released: '已放行', rejected: '已驳回' })[p.status] || p.status }}）
+              {{ p.pack_no }}（{{ p.item_count }} 条 · {{ statusLabel(p.status) }}{{ p.releasable === false ? ' · 不可放行' : '' }}）
             </option>
           </select>
         </div>

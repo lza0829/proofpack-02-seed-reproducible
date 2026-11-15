@@ -32,6 +32,12 @@ def run_checklist(pack_id: int) -> dict[str, Any]:
         pack = pack_repo.get_pack(conn, pack_id)
         if not pack:
             raise HTTPException(status_code=404, detail="证据包不存在")
+        if pack["status"] in ("reference", "voided"):
+            label = "只读对照包" if pack["status"] == "reference" else "已作废包"
+            raise HTTPException(
+                status_code=409,
+                detail=f"该证据包为{label}，只可查看，不得重跑校验或放行。",
+            )
 
         items = pack_repo.list_items(conn, pack_id)
         sample_rows = sample_repo.list_rows(conn, pack["batch_id"])
